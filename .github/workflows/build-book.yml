@@ -1,0 +1,90 @@
+name: build-book
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "phases/**"
+      - "book/**"
+      - "scripts/build_book.py"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+
+jobs:
+  book:
+    name: Build and publish six-volume book
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install verified pandoc release
+        env:
+          PANDOC_VERSION: "3.13"
+          PANDOC_SHA256: "7e3736f255090296ca5d1a14291a76b9b3c43cd385011b1621a4d0c16091a70f"
+        run: |
+          cd "${RUNNER_TEMP}"
+          curl -fsSL --retry 3 --retry-delay 2 -o pandoc.deb \
+            "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"
+          echo "${PANDOC_SHA256}  pandoc.deb" | sha256sum -c -
+          sudo dpkg -i pandoc.deb
+          pandoc --version
+
+      - name: Install Mermaid CLI (optional)
+        continue-on-error: true
+        run: npm install --global @mermaid-js/mermaid-cli
+
+      - name: Install PDF toolchain
+        if: github.event_name != 'push'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            texlive-xetex \
+            texlive-fonts-recommended \
+            texlive-latex-extra \
+            fonts-dejavu-core \
+            librsvg2-bin
+
+      - name: Build all six EPUB volumes
+        if: github.event_name == 'push'
+        run: python3 scripts/build_book.py
+
+      - name: Build all six EPUB and PDF volumes
+        if: github.event_name != 'push'
+        run: python3 scripts/build_book.py --pdf
+
+      - name: Upload EPUB workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: book-epub
+          path: dist/book/*.epub
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload PDF workflow artifact
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: book-pdf
+          path: dist/book/*.pdf
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            dist/book/*.epub \
+            dist/book/*.pdf \
+            --clobber
