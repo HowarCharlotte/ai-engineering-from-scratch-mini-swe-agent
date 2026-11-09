@@ -1,0 +1,203 @@
+name: curriculum
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "phases/**"
+      - "scripts/audit_lessons.py"
+      - "scripts/debias_quizzes.py"
+      - "scripts/build_catalog.py"
+      - "scripts/check_readme_counts.py"
+      - "README.md"
+      - "ROADMAP.md"
+      - "glossary/**"
+      - "site/build.js"
+      - ".github/workflows/curriculum.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "phases/**"
+      - "scripts/audit_lessons.py"
+      - "scripts/debias_quizzes.py"
+      - "scripts/build_catalog.py"
+      - "scripts/check_readme_counts.py"
+      - "README.md"
+      - "ROADMAP.md"
+      - "glossary/**"
+      - "site/build.js"
+      - ".github/workflows/curriculum.yml"
+
+permissions:
+  contents: read
+
+
+jobs:
+  audit:
+    name: Audit curriculum
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit lesson structure
+        run: python3 scripts/audit_lessons.py
+      - name: Check quiz answer distribution
+        run: python3 scripts/debias_quizzes.py --check
+
+  readme-counts-sync:
+    name: Sync README counts
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out triggering branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build temporary catalog
+        run: python3 scripts/build_catalog.py
+      - name: Fix README counts
+        run: python3 scripts/check_readme_counts.py --fix
+      - name: Commit and push README count sync
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- README.md; then
+            echo "README.md already matches catalog.json; no commit needed."
+            exit 0
+          fi
+
+          last_subject="$(git log -1 --pretty=%s)"
+          case "$last_subject" in
+            'chore(readme): sync counts'*)
+              echo "HEAD is already a README counts sync commit; skipping."
+              exit 0
+              ;;
+          esac
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'chore(readme): sync counts'
+
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${BRANCH}"; then
+              echo "Pushed README count sync."
+              exit 0
+            fi
+
+            if [ "$attempt" -ge 3 ]; then
+              echo "::warning::Push retries exhausted; README count sync was not pushed."
+              exit 0
+            fi
+
+            sleep $((attempt * 5))
+            git fetch origin "${BRANCH}:refs/remotes/origin/${BRANCH}"
+            if ! git rebase "origin/${BRANCH}"; then
+              git rebase --abort || true
+              echo "::warning::Rebase failed; aborting README count sync."
+              exit 0
+            fi
+          done
+
+  site-rebuild:
+    name: Rebuild site data
+    needs: readme-counts-sync
+    if: github.event_name == 'push' && needs.readme-counts-sync.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out triggering branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Rebuild site data
+        run: node site/build.js
+      - name: Commit and push site data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- site/data.js; then
+            echo "site/data.js is unchanged; no commit needed."
+            exit 0
+          fi
+
+          last_subject="$(git log -1 --pretty=%s)"
+          case "$last_subject" in
+            'chore(site): rebuild data.js'*)
+              echo "HEAD is already a site rebuild commit; skipping."
+              exit 0
+              ;;
+          esac
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add site/data.js
+          git commit -m 'chore(site): rebuild data.js'
+
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${BRANCH}"; then
+              echo "Pushed site data rebuild."
+              exit 0
+            fi
+
+            if [ "$attempt" -ge 3 ]; then
+              echo "::warning::Push retries exhausted; site data was not pushed."
+              exit 0
+            fi
+
+            sleep $((attempt * 5))
+            git fetch origin "${BRANCH}:refs/remotes/origin/${BRANCH}"
+            if ! git rebase "origin/${BRANCH}"; then
+              git rebase --abort || true
+              echo "::warning::Rebase failed; aborting site data rebuild."
+              exit 0
+            fi
+          done
+
+  readme-counts-drift:
+    name: Check README count drift
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build temporary catalog
+        run: python3 scripts/build_catalog.py
+      - name: Check README counts (advisory)
+        run: |
+          if python3 scripts/check_readme_counts.py; then
+            echo "README counts match catalog.json."
+          else
+            echo "::warning::README counts differ from catalog.json. Main-branch sync will correct them after merge."
+          fi
